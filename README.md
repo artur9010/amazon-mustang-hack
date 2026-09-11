@@ -91,7 +91,8 @@ Verified on our exact build:
       hook hijack, `selroot` 2-packet chain: zero `selinux_state.enforcing`, rewrite
       fake entry to `commit_creds(&init_cred)`. `uid=0`, SELinux Permissive.
 - [_] Stage 4: root script (su, permissive, OTA off) + persistence — root obtained;
-      persistence/verity work remains
+      **persistence blocked** (see SESSION 11): LK gates verity-off/SELinux-permissive on
+      eng/unlocked, boot-time re-exploit has no viable executor. Next: reverse LK/amzn_verify_unlock.
 - [ ] Stage 5: custom OS boot chain
 
 
@@ -897,3 +898,111 @@ entry can be rewritten in place between packets:
   hijack + permissive SELinux are runtime-only and re-running the exploit needs
   the ~1/3 reclaim coin flip.
 - `su` will need a non-nosuid home (`/system`) or a launcher that re-triggers.
+
+## SESSION 11 — PERSISTENCE RECON (Track B + Track A) and the RE handoff
+
+Goal was persistent root. Two tracks were scoped:
+- **Track B**: disable verified boot (dm-verity / SELinux) so `/system` can be patched.
+- **Track A**: re-run the exploit at boot.
+
+Both reduce to the same blocker: **make LK treat the device as `eng`/`unlocked`.**
+
+### Verified-boot facts (exact build)
+- Bootloader locked, AVB `green`, `ro.boot.unlocked_kernel=false`, `ro.boot.secure_cpu=1`,
+  `rpmb_state=1`. Bootrom patched (no BROM); preloader only via CMD short.
+- `/system` is mounted by **Android dm-verity from the lk-built kernel cmdline**:
+  `root=/dev/dm-0 dm="system none ro,0 1 android-verity PARTUUID=b6404ef3-… "`,
+  `veritykeyid=id:f3530e18f64d11fc25eb2dd762979f078de990bf`, `androidboot.veritymode=eio`,
+  `skip_initramfs` (system-as-root). `dm-0` = verity device named `system`; `dm-1` = `/vendor`.
+- LK: Amazon **UFBL**, `ro.boot.lk_version=0x0006`, build `0db73c9-20231025_030009`;
+  preloader `pl_version=0x000a`, build `80c6fcb-20230523_065640`. `/dev/block/by-name/lk` = mmcblk0p5 (1 MB).
+- Full GPT (16 partitions, no `persist`/`seccfg`/`nvram`/`protect`/`para`):
+  `proinfo` p0, `PMT` p1, `kb` p2, `dkb` p3, `lk` p4, `tee1` p5, `tee2` p6, `metadata` p7,
+  `MISC` p8, `reserved` p9, `boot` p10, `recovery` p11, `system` p12, `vendor` p13,
+  `cache` p14, `userdata` p15. eMMC boot0 (1 MB) = preloader (`EMMC_BOOT` magic);
+  boot1 (4 MB) = IDME store.
+
+### LK (UFBL) static findings
+`lk.img` header: `88 16 88 58 | 00052974 | "LK"`; ARM vector table at 0x200, rest Thumb-2,
+position-independent/relocated (literal pools use `ldr+add pc`, so naive base-relative disasm fails).
+Relevant strings (file offsets): `amzn_image_verify`, `amzn_verify_unlock`, `amzn_verify_code_internal`,
+`unlock_code`, `unlock code error`, `unlock failed`, `$Common Kernel Signing Engineering CA0`,
+`seccfg`, `para`, `ENV_v1`, `LK_ENV`, `Kfos_flags`/`Kdev_flags`/`Kusr_flags`/`Kunlock_code`/`Kunlock_version`,
+`FOS_FLAGS_{NONE,ADB_ON,ADB_ROOT,CONSOLE_ON,RAMDUMP_ON,VERBOSITY_ON,ADB_AUTH_DISABLE,FORCE_DM_VERITY,DM_VERITY_OFF,BOOT_DEXOPT}`,
+`[DM-VERITY] verify for system(root) is enabled`, `[DM-VERITY] verify off by fos_flags`,
+`[DM-VERITY] disabled by fos_flags on eng devices or unlocked device`,
+`[SELINUX] set to permissive mode by dev_flags`, `androidboot.prod=1|0`, `androidboot.unlocked_kernel=%s`.
+**Conclusion: LK gates `fos_flags`/`dev_flags` security effects on eng/unlocked.**
+
+### IDME store (eMMC **boot1**) — writable, persistent, read by LK and Android
+- Magic `beefdeed` + `"2.1\0"` + count(0x19=25) at 0x0; items from 0x10.
+- Item format: `char name[16]; u32 size; u32 type(=1); u32 magic(=0x124); u8 data[size] (pad4)`.
+- Item offsets (pristine): `board_id@0x10 serial@0x3c mac_addr@0x68 mac_sec@0x94 bt_mac_addr@0xd0
+  bt_mfg@0xfc product_name@0x198 productid@0x1d4 productid2@0x210 region@0x24c bootmode@0x26c
+  postmode@0x28c bootcount@0x2ac manufacturing@0x2d0 unlock_code@0x4ec sensorcal@0x908 alscal@0x9c4
+  KB@0xa00 DKB@0x1e1c device_type_id@0x2238 dev_flags@0x2274 fos_flags@0x2298 usr_flags@0x22bc
+  wifi_mfg@0x22e0 unlock_version@0x26fc`. Values are ASCII (flags are **hex strings**).
+- Runtime read: `/proc/idme/<name>` (read-only). Last-boot values cached; a write to boot1 takes
+  effect next boot. Write path requires clearing `/sys/block/mmcblk0boot1/force_ro` (root).
+- **Confirmed LK reads boot1**: changing `serial` changed `ro.boot.serialno` on next boot.
+  But LK **truncates serial to 16 bytes** and ignored `fos_flags=0x80`, `dev_flags=0xff`,
+  all-ones, etc. — verity/selinux/`prod` unchanged. So cmdline injection via serial fails.
+
+### Android-side consumers of the IDME flags
+- `/init.fosflags.sh` (service `fosflags`, `u:r:fosflags:s0`): `FOS_FLAGS_ADB_ON=0x1`,
+  `CONSOLE_ON=0x4`, `RAMDUMP_ON=0x8`, `VERBOSITY_ON=0x10`, `ADB_AUTH_DISABLE=0x20`,
+  `BOOT_DEXOPT=0x100`. Verified: setting flags takes effect (`sys.usb=adb`, `noadbauth=1`).
+- **adbd** (unstripped ARM ET_EXEC; `.text` VA 0x8160 / file 0x160; fileoff = VA-0x8000):
+  - `amzn_is_root_allowed` @0x2d5b8 = `amzn_is_dev_unlocked() && (fos_flags & 0x2)`
+  - `amzn_is_adb_auth_disable_allowed` @0x2d5e8 = `fos_flags & 0x20` (ungated)
+  - `amzn_is_dev_unlocked` @0x2d5fc = `/proc/cmdline` contains `androidboot.prod=0` **or**
+    `androidboot.unlocked_kernel=true`
+  - `fos_read_debug_flags` @0x2d724 reads `/proc/idme/<name>` and parses **hex**
+  - `restart_root_service` @0xcb74 / `restart_unroot_service` @0xcc64
+  - strings: `amzn_fos: ADB: Auto-root succeeded`, `… eng_device=%d`, `… unlocked_kernel=%d`,
+    `adbd cannot run as root in production builds`, `ro.debuggable`
+  - `adb root` → "cannot run as root in production builds" (`ro.debuggable=0`) — so even with the
+    auto-root gate satisfied, the AOSP prod check gates the command path.
+
+### Why Session-10 root doesn't persist
+- SELinux permissive + cell hijack + root are runtime-only.
+- `/data/metrics` is a **vpartition**: `/system/bin/vpartition.sh` mounts `/data/vp/metrics.img`
+  (ext4, non-nosuid/noexec) at `/data/metrics` on every boot; `su` written there does **not**
+  survive reboot. (Also why setuid `su` gave uid 0 but **zero caps**.)
+
+### Track A (boot-time re-exploit) — blocked
+- No init `.rc` trigger executes controllable code (imports all verified; `persist.*` triggers only
+  `start` fixed services; scripts in `/system`/`/vendor`).
+- Root services read `/data` configs but never exec from them (`perfmonitord`, `amazonfiled`,
+  `vpartition.sh`, `kisd`, …).
+- Only boot executor = an **app**, but the exploit's paused footprint is **VmRSS 534 MB**
+  (`kbm` spray) → lmkd kills it; plus a lost reclaim panics (`PANIC_ON_OOPS`) → bootloop.
+- **adbd auto-root** exists but is gated on the LK-built cmdline (`prod=0`/`unlocked_kernel=true`).
+
+### Conclusion / next target (chosen: Track B RE)
+Everything hinges on making LK report `eng`/`unlocked`. In reach:
+`androidboot.prod=1|0` and `androidboot.unlocked_kernel=false` are set by LK. Reverse LK to find:
+1. where it reads `fos_flags`/`dev_flags`/`usr_flags` (the `K*` items) and the exact gate;
+2. the `prod`/`unlocked` determination (IDME item? buildvariant? `amzn_verify_unlock` result?);
+3. `amzn_verify_unlock` (libtomcrypt RSA verify) for a bypass or a weak unlock_code/version path;
+4. the `seccfg`/`para`/`ENV_v1`(LK_ENV) storage (not in any dumped partition — maybe tee-protected);
+5. preloader (`boot0`, `EMMC_BOOT`) for a bug.
+If any of these lets us set eng/unlocked (persistently, via boot1 or a raw partition write), then
+`FOS_FLAGS_DM_VERITY_OFF` disables system(root) verity and `/system` can be patched persistently.
+
+### Artifacts (from this session)
+`/tmp/opencode/mustang-dumps/` (may be cleared on host reboot): `lk.img`, `boot1.img` (pristine),
+`boot.img`, `MISC.img`, `metadata*.img`, `pmt.img`, `mbr.img`, `kb.img`, `dkb.img`, `reserved.img`,
+`cache.img`, `boot0.img`, `boot1.img`, `adbd.bin`, `perfmonitord.bin`, `amazonfiled.bin`.
+Helpers: `tools/findinitnet.py`, `findgadget*.py`, `findstores.py`, `adbd_sym.py` (in /tmp);
+repo has `run.sh`, `poc/stage3.c` (`selroot`), `poc/su.c`, `rootcmd.sh`.
+
+### Handy commands
+```
+# IDME read
+/data/metrics/su sh -p -c 'for f in fos_flags dev_flags usr_flags serial region device_type_id unlock_version; do echo -n "$f="; cat /proc/idme/$f; echo; done'
+# write boot1 (root; su lives only until reboot -> re-run run.sh first)
+/data/metrics/su sh -p -c 'echo 0 > /sys/block/mmcblk0boot1/force_ro; dd if=/data/local/tmp/boot1.img of=/dev/block/mmcblk0boot1 bs=4096 count=4; sync; echo 1 > /sys/block/mmcblk0boot1/force_ro'
+# dump a partition to host
+adb exec-out '/data/metrics/su dd if=/dev/block/by-name/lk bs=4096 2>/dev/null' > lk.img
+```
