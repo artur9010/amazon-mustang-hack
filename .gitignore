@@ -1,0 +1,39 @@
+# --- third-party / large source trees -------------------------------------
+# Amazon OSS kernel source (platform.tar + extracted tree) — huge, fetch from
+# the Amazon OSS portal instead.  See README "Artifacts".
+ksrc/
+
+# cloned reference exploits (GhostLock ports etc.) — large third-party repos
+refs/
+
+# --- large / derived kernel artifacts -------------------------------------
+# recovered vmlinux (20 MB) is derived from the OTA; regenerate with
+# vmlinux-to-elf if you need it for offline analysis.
+kernel/vmlinux
+kernel/*.elf
+
+# --- firmware / images / archives -----------------------------------------
+*.tar
+*.tar.bz2
+*.tar.gz
+*.tgz
+*.zip
+*.bin
+*.img
+*.elf
+
+# --- build outputs ---------------------------------------------------------
+st2
+st3
+su
+poc/juaf
+poc/st2
+poc/st3
+poc/su
+*.o
+*.a
+
+# --- tooling / session -----------------------------------------------------
+.opencode/
+__pycache__/
+*.pyc

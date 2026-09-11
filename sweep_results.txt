@@ -1,0 +1,39 @@
+SWEEP DONE
+=== PROBE 0x18 ===
+0x18: last-trace: [-] no root
+0x18: uptime: 600
+=== PROBE 0x1c ===
+0x1c: last-trace: [-] no root
+0x1c: uptime: 614
+=== PROBE 0x20 ===
+0x20: last-trace: [-] no root
+0x20: uptime: 628
+=== PROBE 0x24 ===
+0x24: last-trace: [-] no root
+0x24: uptime: 642
+=== PROBE 0x28 ===
+0x28: last-trace: [-] no root
+0x28: uptime: 656
+=== PROBE 0x2c ===
+0x2c: DEVICE DIED (crash)
+0x2c: last-trace: [*] consumer: sched_setattr NOW
+0x2c: uptime: 18
+=== PROBE 0x30 ===
+0x30: last-trace: [-] no root
+0x30: uptime: 32
+=== PROBE 0x34 ===
+0x34: DEVICE DIED (crash)
+0x34: last-trace: [*] consumer: sched_setattr NOW
+0x34: uptime: 17
+=== PROBE 0x38 ===
+0x38: last-trace: [-] no root
+0x38: uptime: 31
+=== PROBE 0x3c ===
+0x3c: DEVICE DIED (crash)
+0x3c: last-trace: [*] consumer: sched_setattr NOW
+0x3c: uptime: 17
+=== PROBE 0x40 ===
+0x40: DEVICE DIED (crash)
+0x40: last-trace: [*] consumer: sched_setattr NOW
+0x40: uptime: 17
+SWEEP DONE
