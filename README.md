@@ -1082,8 +1082,11 @@ root=/dev/dm-0 dm="system none ro,0 1 android-verity PARTUUID=..."  (unchanged)
 androidboot.prod=1 / secure_cpu=1 / buildvariant=user  (unchanged)
 ```
 `fos_flags=0x80` is `FOS_FLAGS_DM_VERITY_OFF`; the decoded gate would have turned
-verity off **if** the getter had returned it.  It did not.  Therefore the getter
-(at least at verity-protection time) is **not** reading the boot1 IDME items.
+verity off **if** the getter had returned it.  It did not.  The gate is live, not
+dead code: its one-time cache sentinel is `-1` in the image
+(`*(u32*)0x50c74 == 0xffffffff`), so the function really executed the
+`check_flag("fos_flags",0x80)` path and got 0.  Therefore the getter (at least
+at verity-protection time) is **not** reading the boot1 IDME items.
 
 The other candidate store is the **LK env**, loaded from a partition literally
 named `"para"` (loader 0x12fd4, magic `ENV_v1`, checksum @0x3ffc).  LK's own
