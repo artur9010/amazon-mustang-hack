@@ -32,6 +32,8 @@ you re-run `run.sh`.
 Prebuilt `st3` and `su` (armv7 static) are committed, so no toolchain is needed
 to run. `./run.sh --build` rebuilds them from `poc/*.c` if you have zig.
 
+# Anything below is just a log of work done by model, no hooman input below.
+
 ## PRIMARY TARGET (since session 5): kbase CVE-2022-38181 — stage 2 PROVEN
 
 GhostLock (below) is parked: MTK's BUG_ON rtmutex variant + zero kernel-address
@@ -1005,4 +1007,149 @@ repo has `run.sh`, `poc/stage3.c` (`selroot`), `poc/su.c`, `rootcmd.sh`.
 /data/metrics/su sh -p -c 'echo 0 > /sys/block/mmcblk0boot1/force_ro; dd if=/data/local/tmp/boot1.img of=/dev/block/mmcblk0boot1 bs=4096 count=4; sync; echo 1 > /sys/block/mmcblk0boot1/force_ro'
 # dump a partition to host
 adb exec-out '/data/metrics/su dd if=/dev/block/by-name/lk bs=4096 2>/dev/null' > lk.img
+```
+
+## SESSION 12 — LK RE: the eng/unlocked gate is real, and unsigned flag stores do not exist
+
+Goal: get LK to treat the device as `eng`/`unlocked`, or find a preloader/LK bug,
+so verity/SELinux can be disabled persistently.  Result: **reversed the relevant
+LK code path end-to-end; the flip is not reachable by the available stores.**
+No device was bricked; the one boot1 experiment was reverted to pristine.
+
+### LK is Thumb-2 PIC, relocated to base 0xFF400000
+`lk.img` begins with a tiny ARM stub (file 0x200).  The relocator at 0x224
+copies from `0x200` to a literal destination and branches to a literal entry:
+
+| literal (file off) | value        | meaning                       |
+|--------------------|--------------|-------------------------------|
+| 0x270              | `0xFF4002F8` | `str r4,[r6]` scratch         |
+| 0x274              | `0xFF40027C` | destination (base+0x27C)      |
+| 0x278              | `0xFF54A440` | copy end (incl. BSS)          |
+| 0x27C              | `0xFF400484` | entry point                   |
+
+So **runtime address = 0xFF400000 + file offset** for offsets >= 0x200.
+Everything after the stub is Thumb-2, position-independent.  Strings are built
+with `ldr rT,[pc,#imm]` (T1 offset = imm8*4; `ldr.w` offset = imm12) followed by
+`add rT, pc`; the target is `(add+4) + *pool`.  A robust scanner that survives
+the ARM stub and literal pools was added as `tools/lk_xref.py` (handles 16- and
+32-bit forms, scans every 2 bytes).  All offsets below are **file offsets**;
+add 0xFF400000 for runtime addresses.
+
+### Decoded control flow (offset -> meaning)
+| offset | function |
+|--------|----------|
+| `0xdf7c` | `is_secure_or_prod()` -> `byte[ [[g]+0 ] + 0x163 ]`; `g` = global @0x52838. 1 on this unit. |
+| `0x20b4` | `verify_stored_unlock()` = memset(buf,0,0x100); read IDME/env `unlock_code` (0x100) via `0x57c`; `bl 0x222c`; return `(verify==0)`. |
+| `0x222c` / `0x20f0` | `amzn_verify_unlock(code,len)` — libtomcrypt RSA/PKCS#1 verify (see below). |
+| `0xda3e` | `is_unlocked()` = `is_secure_or_prod() && verify_stored_unlock()`. |
+| `0x29a28` | `is_verity_disabled()` = `(fos_flags & 0x80) && !(is_secure_or_prod() && verify_stored_unlock())`; cached in global @0x50c74. |
+| `0x29974` | SELinux cmdline builder: `dev_flags & 0x20` -> `androidboot.selinux=enforce`, `dev_flags & 0x40` -> `...=permissive` (each gated by `byte[+0x162]`). |
+| `0x118xx`/`0x11bxx` | kernel cmdline builder (`unlocked_kernel`, `prod=1/0`, `verifiedbootstate`, `rpmb_state`, `secure_cpu`, versions, `root=`). |
+| `0x27af8` | UART gate: `fos_flags & 0x4` -> `printk.disable_uart=0`, else `=1`. |
+| `0x12fd4` | **LK env loader**: partition `"para"`, 0x4000 bytes, magic `ENV_v1`, checksum = sum of bytes over 0x3ffc compared to word @0x3ffc. |
+| `0x1efd0` | partition lookup by name (used for `"para"`, `"boot"`, ...). |
+| `0x57c` | getter dispatcher through callback slot @0x58218; slots @0x58200..0x5821c are registered from a table at 0x5a8-0x734. |
+| `0x2a19c` | `fastboot oem unlock`: `bl 0x222c(code,len)`; on success writes `unlock_code` (0x100) via `0x408`. |
+
+### The unlock code is Amazon-RSA-signed — not forgeable
+`0x20b4` reads the `unlock_code` IDME item (0x400 bytes, **all zero** on this
+unit) and runs `amzn_verify_unlock` (0x222c -> 0x20f0).  That function drives
+libtomcrypt (dozens of `/features/libtomcrypt/src/pk/asn1/der/...` paths and
+RSA verify), and the image embeds the certificate material:
+`Sunnyvale` / `Amazon Lab126` / `"$Common Kernel Signing Engineering CA0"` at
+0x317d9+, plus the diagnostics
+`Image FAILED AUTHENTICATION on PRODUCTION device` (0x3166e),
+`Authentication failed on engineering device with production certificate` (0x316a0),
+`Image FAILED AUTHENTICATION on ENGINEERING device` (0x31703),
+`Image AUTHENTICATED with PRODUCTION certificate` (0x31736).
+There is no empty-code / length / version shortcut: `verify(zeros) != 0`, hence
+`unlocked_kernel=false` (confirmed in `/proc/cmdline`).  Flipping
+`androidboot.unlocked_kernel` or `androidboot.prod` requires either a valid
+Amazon-signed `unlock_code` (private key unavailable) or a code-execution bug in
+the verifier.  Nothing exploitable (bounds/size) was found statically in
+0x20b4/0x222c/0x20f0.  => **the eng/unlocked flip via the documented path is
+cryptographically infeasible.**
+
+### The verity/SELinux flags do not come from a store that exists
+The security flags are read through the getter at `0x57c`.  Empirical test:
+
+```
+# boot1 IDME item fos_flags data (offset 0x22B4, 8 bytes) set to "00000080"
+dd if=/dev/block/mmcblk0boot1 ... ; reboot
+/proc/idme/fos_flags  -> 00000080        (persisted, Android sees it)
+ro.boot.veritymode    -> eio             (unchanged!)
+root=/dev/dm-0 dm="system none ro,0 1 android-verity PARTUUID=..."  (unchanged)
+androidboot.prod=1 / secure_cpu=1 / buildvariant=user  (unchanged)
+```
+`fos_flags=0x80` is `FOS_FLAGS_DM_VERITY_OFF`; the decoded gate would have turned
+verity off **if** the getter had returned it.  It did not.  Therefore the getter
+(at least at verity-protection time) is **not** reading the boot1 IDME items.
+
+The other candidate store is the **LK env**, loaded from a partition literally
+named `"para"` (loader 0x12fd4, magic `ENV_v1`, checksum @0x3ffc).  LK's own
+partition table (0x4fcc0..0x50340) lists preloader/proinfo/nvram/protect1/
+protect2/persist/seccfg/secro/**para**/logo/custom/expdb/tee1/tee2/metadata/
+system/cache/userdata — but the tablet's actual GPT has **only 16 entries**, all
+type `af3dc60f838472478e793d69d8477de4`:
+
+```
+#0 proinfo 0x400   #1 PMT 0x1c00    #2 kb 0x4000     #3 dkb 0x4800
+#4 lk 0x5000       #5 tee1 0x5800   #6 tee2 0x8000   #7 metadata 0xa800
+#8 MISC 0x1e400   #9 reserved 0x1e800  #10 boot 0x22800  #11 recovery 0x2a800
+#12 system 0x34800 #13 vendor 0x644000 #14 cache 0x6b4800 #15 userdata 0x7ae800
+```
+There is **no `para`, `seccfg`, `nvram`, `protect`, or `persist` partition** on
+this product (and `PMT`/`pmt.img` dumps are all-zero).  So the LK env is empty,
+the `Kfos_flags`/`Kdev_flags` keys never exist, and all `fos_flags`/`dev_flags`
+checks resolve to 0 — independently of what the IDME items contain.  The boot1
+IDME items are consumed by Android (`/init.fosflags.sh`, `adbd`,
+`/proc/idme/*`) but not by LK's security gates.
+
+### Conclusion — why persistent eng/unlock is blocked
+1. `unlocked_kernel` requires an Amazon-signed `unlock_code` (RSA/libtomcrypt,
+   embedded CA).  Not forgeable offline; no verifier bug found.  **Hard block.**
+2. The `DM_VERITY_OFF` / `selinux=permissive` flags are consumed from the LK env
+   (`para`/`ENV_v1`), which does not exist on this GPT.  IDME `fos_flags` is
+   empirically ignored by LK (0x80 persisted, verity stayed `eio`).  **Hard
+   block** unless the partition table is modified.
+3. Even a successful `fos_flags=0x80` would only set `androidboot.veritymode=
+   disabled` and a non-`dm-0` `root=`; it would not unlock, and SELinux would
+   still need `dev_flags` from the same absent env to go permissive.
+4. Track A (boot-time re-exploit) therefore remains blocked exactly as in
+   SESSION 11: its only unlock path is the same LK gate.
+
+### Remaining avenues (future, higher risk; not attempted)
+- **Synthesize a `para`/`ENV_v1` store**: add a GPT entry named `para` (primary
+  + backup GPT must both be updated) in the free space after `userdata`
+  (userdata ends LBA 0x3a3dfde; disk = 30535680 sectors), then craft an env with
+  `fos_flags=0x80` and `dev_flags=0x40` (checksum at +0x3ffc = byte sum over
+  0x3ffc).  This is the only remaining route to verity-off.  Risks: corrupting
+  the primary/backup GPT can brick; and it was **not proven** that the verity
+  gate actually reads `para` (only that it is not boot1 IDME).
+- **Preloader (`boot0`/`EMMC_BOOT`) bug**: not reversed this session.  Writing
+  boot0 is forbidden until a pristine copy and a recovery path exist.
+- **Verifier research**: the engineering-certificate path (0x316a0/0x31703) is
+  only reachable with a device identity accepted as "engineering" plus a code
+  signed by the engineering key; no private key is available.
+
+### Artifacts / reproducibility
+- Tool added: `tools/lk_xref.py` — base-independent LK string-xref resolver.
+- Dumps used: `/tmp/opencode/mustang-dumps/lk.img`, `boot1.img` (pristine),
+  `boot0.img`, `mbr.img` (GPT), `pmt.img` (all-zero).
+- boot1 experiment image (fos_flags=0x80) kept at
+  `/tmp/opencode/s12/boot1_f80.img`; **device restored to pristine boot1**
+  (verified `/proc/idme/fos_flags` -> `0`).
+
+### Handy commands (root required; re-arm with `./run.sh`)
+```
+# re-arm runtime root (~1/3 per boot)
+./run.sh --no-build
+
+# confirm LK's decisions without a UART
+/data/metrics/su /system/bin/sh -p -c 'cat /proc/cmdline'
+#   watch: root=/dev/dm-0 dm="system ... android-verity ..."  (verity on)
+#          androidboot.veritymode=eio ; androidboot.selinux=enforce ; prod=1
+
+# IDME read (Android copy; NOT what LK's gates use)
+for f in fos_flags dev_flags usr_flags unlock_version serial; do cat /proc/idme/$f; echo; done
 ```
