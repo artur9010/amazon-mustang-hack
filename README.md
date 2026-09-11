@@ -29,6 +29,9 @@ The reclaim wins roughly **1 boot in 3** and a loss panics/reboots the tablet;
 part of the exploit, so root is **runtime-only** — a reboot restores stock and
 you re-run `run.sh`.
 
+Prebuilt `st3` and `su` (armv7 static) are committed, so no toolchain is needed
+to run. `./run.sh --build` rebuilds them from `poc/*.c` if you have zig.
+
 ## PRIMARY TARGET (since session 5): kbase CVE-2022-38181 — stage 2 PROVEN
 
 GhostLock (below) is parked: MTK's BUG_ON rtmutex variant + zero kernel-address
