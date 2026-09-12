@@ -84,6 +84,37 @@ class PreloaderHID:
         return d
 
     # --- MTK preloader protocol -------------------------------------------
+    def info(self):
+        try:
+            print("[*] manufacturer: %r" % self.dev.manufacturer)
+            print("[*] product     : %r" % self.dev.product)
+            print("[*] serial      : %r" % self.dev.serial_number)
+        except Exception as e:
+            print("[*] string descriptors unavailable: %s" % e)
+        try:
+            rdesc = self.dev.ctrl_transfer(0x81, 0x06, 0x2200, 0, 255, timeout=2000)
+            print("[*] HID report descriptor (%d bytes): %s" %
+                  (len(rdesc), bytes(rdesc).hex()))
+        except Exception as e:
+            print("[*] report descriptor: %s" % e)
+
+    def listen(self, secs=6):
+        print("[*] listening on EP IN for %ds ..." % secs)
+        deadline = time.time() + secs
+        n = 0
+        while time.time() < deadline:
+            try:
+                d = bytes(self.ep_in.read(64, timeout=500))
+            except usb.core.USBTimeoutError:
+                continue
+            except Exception as e:
+                print("[-] read: %s" % e)
+                break
+            if d:
+                n += 1
+                print("    %s  %s" % (time.strftime("%H:%M:%S"), d.hex()))
+        print("[*] %d report(s) received" % n)
+
     def handshake(self, verbose=True):
         for b in (0xA0, 0x0A, 0x50, 0x05):
             self.write(bytes([b]))
@@ -145,6 +176,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("handshake")
+    sub.add_parser("info")
+    lp = sub.add_parser("listen")
+    lp.add_argument("secs", nargs="?", type=int, default=6)
+    rp = sub.add_parser("raw")
+    rp.add_argument("hexbytes", nargs="+", help="e.g. a0 or a0 00 00 00")
     p = sub.add_parser("read32")
     p.add_argument("addr", type=lambda s: int(s, 0))
     p.add_argument("nwords", type=lambda s: int(s, 0))
@@ -155,6 +191,21 @@ def main():
 
     pl = PreloaderHID()
     print("[*] transport up (maxpkt=%d)" % pl.pktsize)
+    if a.cmd == "info":
+        pl.info()
+        pl.close()
+        return
+    if a.cmd == "listen":
+        pl.listen(a.secs)
+        pl.close()
+        return
+    if a.cmd == "raw":
+        data = bytes(int(x, 16) for x in a.hexbytes)
+        print("[*] raw OUT: %s" % data.hex())
+        pl.write(data)
+        pl.listen(2)
+        pl.close()
+        return
     if not pl.handshake():
         raise SystemExit("[-] handshake failed")
     print("[+] handshake OK")
