@@ -1156,3 +1156,69 @@ IDME items are consumed by Android (`/init.fosflags.sh`, `adbd`,
 # IDME read (Android copy; NOT what LK's gates use)
 for f in fos_flags dev_flags usr_flags unlock_version serial; do cat /proc/idme/$f; echo; done
 ```
+
+## SESSION 13 — the preloader is reachable after all (`1949:20ff` = MTK preloader, HID transport)
+
+While powered off and plugged into USB, the tablet enumerates as **`1949:20ff`**
+(`Lab126`) — *not* Android and *not* the `0e8d:0003` bootrom.  Descriptor:
+
+```
+bInterfaceClass 3 (HID), iConfiguration "HID", iInterface "HID Interface"
+HID report descriptor = 05 01 09 00 a1 01 c0   (empty collection!)
+EP 0x81 IN  interrupt  4 bytes, bInterval 4
+EP 0x01 OUT interrupt  4 bytes, bInterval 4
+iSerial = GCC0X90805310009 (the IDME serial)
+```
+
+**Identification.** `0x20FF` is listed as **"MTK Preloader"** in mtkclient's
+`config/usb_ids.py` (under MediaTek VID `0x0e8d`: `0xe8d:{0x0003 Brom,
+0x2000/0x2001/0x20ff/0x3000 Preloader}`).  Amazon kept the preloader PID and
+changed the VID to `0x1949`, and present it as a HID endpoint pair with a dummy
+report descriptor.  So this is the **MediaTek preloader / USBDL mode**, a stage
+*below* LK — reached here by power-off + plug, not by the CMD short.
+
+The descriptor strings "HID"/"HID Interface" are not present in `lk.img`,
+`boot0.img`, `boot.img` or the other dumps, i.e. the mode is produced by a
+component we have not dumped (bootrom/TEE) or is assembled at runtime.
+
+**Why this matters.**  The Amazon preloader used by `aftv2-tools` exposes
+built-in, **Download-Agent-less** commands over this exact byte stream:
+
+```
+handshake : host A0 0A 50 05 -> dev 5F F5 AF FA
+0xD1 read32 (addr, n_words)  : echo cmd/addr/n, 00 00, n*u32, 00 00
+0xD4 write32(addr, words[])  : echo cmd/addr/n, 00 00, n*u32, 00 00
+```
+
+`aftv2-tools/read_mmc.py` uses `read32`/`write32` to poke the MSDC controller
+(base `0x11230000` on MT8173; verify for MT8163) and read/write **raw eMMC
+blocks** with no DA and thus no AVB/verity in the way.  If mustang's preloader
+accepts 0xD1/0xD4, that is a direct path to persistent unlock (patch `boot` /
+`lk`), independent of the RSA unlock code and the absent LK env.
+
+### Tools added (root needed; chmod the USB node first)
+```
+lsusb -d 1949:20ff                 # note Bus/Dev, e.g. Bus 001 Device 003
+sudo chmod 666 /dev/bus/usb/001/003
+# 1) does it answer the MTK handshake? (no DA, no flash access)
+nix-shell -p python3Packages.pyusb --run \
+    'python3 tools/mtk_preloader_hid.py handshake'
+# 2) read-only arbitrary memory read
+nix-shell -p python3Packages.pyusb --run \
+    'python3 tools/mtk_preloader_hid.py read32 0x00100000 4'
+```
+`tools/probe_preloader.py` is the minimal handshake-only probe;
+`tools/mtk_preloader_hid.py` is the full transport (`handshake`/`read32`/
+`write32`; `write32` is guarded and should not be used until the eMMC register
+map is confirmed).
+
+### Status / next steps
+- **Unconfirmed**: whether mustang's preloader actually implements 0xD1/0xD4
+  (the handshake probe decides this).  If it does, the aftv2 eMMC read/write
+  path can likely be ported directly.
+- Then: find the MT8163 MSDC base (kernel DT or preloader), dump a partition
+  (`read_mmc`), then patch `boot.img`/`lk` from the preloader and reboot.
+- This is a *lower* boot stage than everything in SESSION 12, so it does not
+  depend on `amzn_verify_unlock` or the LK env gate.
+- Do NOT run SP Flash Tool / mtkclient writes against it before the protocol and
+  eMMC layout are confirmed.
