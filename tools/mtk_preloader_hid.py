@@ -115,6 +115,48 @@ class PreloaderHID:
                 print("    %s  %s" % (time.strftime("%H:%M:%S"), d.hex()))
         print("[*] %d report(s) received" % n)
 
+    def probe(self):
+        """Try several plausible framings; print anything the device answers."""
+        import usb.util as uu
+        self.ep_in.read(64, timeout=200)  # flush
+        trials = [
+            ("1B 'a0'", lambda: self.write(b"\xa0")),
+            ("4B 'a0 00 00 00'", lambda: self.write(b"\xa0\x00\x00\x00")),
+            ("4B 'a0 0a 50 05'", lambda: self.write(b"\xa0\x0a\x50\x05")),
+            ("8B 'a0 0a 50 05 x4'", lambda: self.write(b"\xa0\x0a\x50\x05" * 2)),
+            ("SET_REPORT a0", lambda: self.dev.ctrl_transfer(0x21, 0x09, 0x0200, 0,
+                                                              b"\xa0", timeout=1000)),
+            ("SET_REPORT a0 00 00 00", lambda: self.dev.ctrl_transfer(0x21, 0x09, 0x0200, 0,
+                                                                     b"\xa0\x00\x00\x00", timeout=1000)),
+            ("vendor OUT 0x40/0x01 a0", lambda: self.dev.ctrl_transfer(0x40, 0x01, 0, 0,
+                                                                      b"\xa0", timeout=1000)),
+        ]
+        for name, fn in trials:
+            try:
+                r = fn()
+                print("  %-26s sent (ctrl ret=%s)" % (name, r))
+            except Exception as e:
+                print("  %-26s ERROR %s" % (name, e))
+                continue
+            for _ in range(4):
+                try:
+                    d = bytes(self.ep_in.read(64, timeout=400))
+                except usb.core.USBTimeoutError:
+                    continue
+                except Exception as e:
+                    print("      read: %s" % e)
+                    break
+                if d:
+                    print("      <= %s" % d.hex())
+        # control IN probe
+        for name, fn in [("GET_REPORT input", lambda: self.dev.ctrl_transfer(0xA1, 0x01, 0x0100, 0, 64, timeout=1000)),
+                         ("vendor IN 0xC0/0x01", lambda: self.dev.ctrl_transfer(0xC0, 0x01, 0, 0, 64, timeout=1000))]:
+            try:
+                d = bytes(fn())
+                print("  %-26s => %s" % (name, d.hex() or "<empty>"))
+            except Exception as e:
+                print("  %-26s ERROR %s" % (name, e))
+
     def handshake(self, verbose=True):
         for b in (0xA0, 0x0A, 0x50, 0x05):
             self.write(bytes([b]))
@@ -177,6 +219,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("handshake")
     sub.add_parser("info")
+    sub.add_parser("probe")
     lp = sub.add_parser("listen")
     lp.add_argument("secs", nargs="?", type=int, default=6)
     rp = sub.add_parser("raw")
@@ -193,6 +236,10 @@ def main():
     print("[*] transport up (maxpkt=%d)" % pl.pktsize)
     if a.cmd == "info":
         pl.info()
+        pl.close()
+        return
+    if a.cmd == "probe":
+        pl.probe()
         pl.close()
         return
     if a.cmd == "listen":
